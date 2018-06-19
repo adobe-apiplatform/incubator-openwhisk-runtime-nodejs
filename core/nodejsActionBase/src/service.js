@@ -16,25 +16,11 @@
  */
 
 var NodeActionRunner = require('../runner');
-var fs = require('fs');
 
 function NodeActionService(config) {
-    var Status = {
-        ready: 'ready',
-        starting: 'starting',
-        running: 'running',
-        stopped: 'stopped'
-    };
 
-    var status = Status.ready;
     var server = undefined;
     var userCodeRunner = undefined;
-
-    function setStatus(newStatus) {
-        if (status !== Status.stopped) {
-            status = newStatus;
-        }
-    }
 
     /**
      * An ad-hoc format for the endpoints returning a Promise representing,
@@ -72,28 +58,21 @@ function NodeActionService(config) {
      *  req.body = { main: String, code: String, binary: Boolean }
      */
     this.initCode = function initCode(req) {
-        if (status === Status.ready) {
-            setStatus(Status.starting);
+      var body = req.body || {};
+      var message = body.value || {};
 
-            var body = req.body || {};
-            var message = body.value || {};
-
-            if (message.main && message.code && typeof message.main === 'string' && typeof message.code === 'string') {
-                return doInit(message).then(function (result) {
-                    return responseMessage(200, { OK: true });
-                }).catch(function (error) {
-                    // this writes to the activation logs visible to the user
-                    console.error('Error during initialization:', error);
-                    var errStr = error.stack ? String(error.stack) : error;
-                    return Promise.reject(errorMessage(502, "Initialization has failed due to: " + errStr));
-                });
-            } else {
-                setStatus(Status.ready);
-                return Promise.reject(errorMessage(500, "Missing main/no code to execute."));
-            }
-        } else {
-            return Promise.reject(errorMessage(502, "Internal system error: system not ready, status: " + status));
-        }
+      if (message.main && message.code && typeof message.main === 'string' && typeof message.code === 'string') {
+        return doInit(message).then(function (result) {
+          return responseMessage(200, {OK: true});
+        }).catch(function (error) {
+          // this writes to the activation logs visible to the user
+          console.error('Error during initialization:', error);
+          var errStr = error.stack ? String(error.stack) : error;
+          return Promise.reject(errorMessage(502, "Initialization has failed due to: " + errStr));
+        });
+      } else {
+        return Promise.reject(errorMessage(500, "Missing main/no code to execute."));
+      }
     };
 
     /**
@@ -105,41 +84,28 @@ function NodeActionService(config) {
      * req.body = { value: Object, meta { activationId : int } }
      */
     this.runCode = function runCode(req) {
-        if (status === Status.ready) {
-            setStatus(Status.running);
-
-            return doRun(req).then(function (result) {
-                setStatus(Status.ready);
-
-                if (typeof result !== "object") {
-                    console.error('Result must be of type object but has type "' + typeof result + '":', result);
-                    return errorMessage(502, "The action did not return a dictionary.");
-                } else {
-                    return responseMessage(200, result);
-                }
-            }).catch(function (error) {
-                setStatus(Status.ready);
-
-                return Promise.reject(errorMessage(500, "An error has occurred: " + error));
-            });
-        } else {
-            console.log('[runCode]', 'cannot schedule runCode due to status', status);
-            return Promise.reject(errorMessage(500, "Internal system error: container not ready, status: " + status));
-        }
+        return doRun(req).then(function (result) {
+            if (typeof result !== "object") {
+                console.error('Result must be of type object but has type "' + typeof result + '":', result);
+                return errorMessage(502, "The action did not return a dictionary.");
+            } else {
+                return responseMessage(200, result);
+            }
+        }).catch(function (error) {
+            return Promise.reject(errorMessage(500, "An error has occurred: " + error));
+        });
     };
 
     function doInit(message) {
         userCodeRunner = new NodeActionRunner();
 
         return userCodeRunner.init(message).then(function (result) {
-            setStatus(Status.ready);
             // 'true' has no particular meaning here. The fact that the promise
             // is resolved successfully in itself carries the intended message
             // that initialization succeeded.
             return true;
         }).catch(function (error) {
             writeMarkers();
-            setStatus(Status.stopped);
             return Promise.reject(error);
         });
     }
