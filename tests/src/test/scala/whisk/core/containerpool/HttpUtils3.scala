@@ -23,6 +23,7 @@ import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.model.HttpMethods
 import akka.http.scaladsl.model.HttpRequest
 import akka.http.scaladsl.model.MessageEntity
+import akka.http.scaladsl.unmarshalling.Unmarshal
 import org.apache.http.client.protocol.HttpClientContext
 import org.apache.http.protocol.HttpContext
 import scala.concurrent.Await
@@ -33,6 +34,7 @@ import scala.util.Try
 import spray.json._
 import whisk.common.Logging
 import whisk.common.TransactionId
+import whisk.core.entity.ActivationResponse.ContainerHttpError
 import whisk.core.entity.ActivationResponse._
 import whisk.core.entity.ByteSize
 import whisk.core.entity.size.SizeLong
@@ -80,13 +82,20 @@ protected class HttpUtils3(hostname: String,
     val req = b.map { b =>
       HttpRequest(HttpMethods.POST, endpoint, entity = b)
     }
-    requestJson[JsObject](req).map({
-      case Right(response) =>
-        Right(ContainerResponse(true, response.toString))
-      case Left(code) =>
-        throw new IllegalStateException(s"invalid response ${code}")
-    })
+    request(req).flatMap({ response =>
+      if (response.status.isSuccess()) {
+        Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
+          Right(ContainerResponse(true, o.toString))
+        }
+      } else {
+        // This is important, as it drains the entity stream.
+        // Otherwise the connection stays open and the pool dries up.
+        Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
+          Right(new ContainerResponse(response.status.intValue(), o.toString(), None))
+        }
 
+      }
+    })
   }
 }
 object HttpUtils3 {
