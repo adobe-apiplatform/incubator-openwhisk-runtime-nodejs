@@ -59,7 +59,6 @@ protected class HttpUtils3(hostname: String,
                            maxResponse: ByteSize,
                            maxConcurrent: Int = 1)(implicit logging: Logging, as: ActorSystem)
     extends PoolingRestClient("http", hostname, port, 16 * 1024) {
-  println("using HttpUtils3")
 
   def close() = Unit //Try(connection.close())
 

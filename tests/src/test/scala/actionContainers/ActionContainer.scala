@@ -240,6 +240,6 @@ object ActionContainer {
 
     implicit val transid = TransactionId.testing
 
-    whisk.core.containerpool.HttpUtils3.concurrentPost(host, port, endPoint, contents, 30.seconds)
+    whisk.core.containerpool.HttpUtils3.concurrentPost(host, port, endPoint, contents, 60.seconds)
   }
 }

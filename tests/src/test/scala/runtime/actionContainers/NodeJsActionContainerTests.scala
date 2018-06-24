@@ -549,8 +549,14 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
   }
 
   it should "allow running activations concurrently" in {
+
+    val concurrentCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
+    require(concurrentCount > 100, "test requires that max-connections be set > 100")
+    println(s"running $concurrentCount requests")
+
     val (out, err) = withNodeJsContainer { c =>
       //this action will create a log entry, and only complete once all activations have arrived and emitted logs
+
       val code =
         s"""
            | global.count = 0;
@@ -559,22 +565,21 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
            |     console.log("interleave me");
            |     return new Promise(function(resolve, reject) {
            |         setTimeout(function() {
-           |             if (global.count == 3) {
+           |             if (global.count == $concurrentCount) {
            |                 resolve({ args: args});
            |             } else {
-           |                 reject("did not receive 2 activations within 10s");
+           |                 reject("did not receive $concurrentCount activations within 20s");
            |             }
-           |         }, 10000);
+           |         }, 20000);
            |    });
            | }
         """.stripMargin
 
       c.init(initPayload(code))._1 should be(200)
 
-      val payloads = Seq(
-        JsObject("arg1" -> JsString("value1")),
-        JsObject("arg2" -> JsString("value2")),
-        JsObject("arg3" -> JsString("value4")))
+      val payloads = (1 to concurrentCount).map({ i =>
+        JsObject(s"arg$i" -> JsString(s"value$i"))
+      })
 
       val responses = c.runMultiple(payloads.map {
         runPayload(_)
@@ -586,12 +591,12 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
     checkStreams(out, err, {
       case (o, e) =>
-        o.replaceAll("\n", "") shouldBe "interleave meinterleave meinterleave me"
+        o.replaceAll("\n", "") shouldBe "interleave me" * concurrentCount
         e shouldBe empty
-    }, 3)
+    }, concurrentCount)
 
     withClue("expected grouping of stdout sentinels") {
-      out should include((1 to 2).map(_ => ActionContainer.sentinel + "\n").mkString)
+      out should include((ActionContainer.sentinel + "\n") * concurrentCount)
     }
   }
 }
