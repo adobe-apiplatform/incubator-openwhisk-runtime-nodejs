@@ -559,7 +559,7 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
            |     console.log("interleave me");
            |     return new Promise(function(resolve, reject) {
            |         setTimeout(function() {
-           |             if (global.count == 2) {
+           |             if (global.count == 3) {
            |                 resolve({ args: args});
            |             } else {
            |                 reject("did not receive 2 activations within 10s");
@@ -571,7 +571,10 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
       c.init(initPayload(code))._1 should be(200)
 
-      val payloads = Seq(JsObject("arg1" -> JsString("value1")), JsObject("arg2" -> JsString("value2")))
+      val payloads = Seq(
+        JsObject("arg1" -> JsString("value1")),
+        JsObject("arg2" -> JsString("value2")),
+        JsObject("arg3" -> JsString("value4")))
 
       val responses = c.runMultiple(payloads.map {
         runPayload(_)
@@ -583,9 +586,9 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
     checkStreams(out, err, {
       case (o, e) =>
-        o.replaceAll("\n", "") shouldBe "interleave meinterleave me"
+        o.replaceAll("\n", "") shouldBe "interleave meinterleave meinterleave me"
         e shouldBe empty
-    }, 2)
+    }, 3)
 
     withClue("expected grouping of stdout sentinels") {
       out should include((1 to 2).map(_ => ActionContainer.sentinel + "\n").mkString)
