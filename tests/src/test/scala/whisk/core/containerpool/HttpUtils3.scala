@@ -24,13 +24,12 @@ import akka.http.scaladsl.model.HttpMethods
 import akka.http.scaladsl.model.HttpRequest
 import akka.http.scaladsl.model.MessageEntity
 import akka.http.scaladsl.unmarshalling.Unmarshal
-import org.apache.http.client.protocol.HttpClientContext
-import org.apache.http.protocol.HttpContext
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.util.Try
+import scala.util.control.NoStackTrace
 import spray.json._
 import whisk.common.Logging
 import whisk.common.TransactionId
@@ -81,22 +80,27 @@ protected class HttpUtils3(hostname: String,
     val req = b.map { b =>
       HttpRequest(HttpMethods.POST, endpoint, entity = b)
     }
-    request(req).flatMap({ response =>
-      if (response.status.isSuccess()) {
-        Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
-          Right(ContainerResponse(true, o.toString))
-        }
-      } else {
-        // This is important, as it drains the entity stream.
-        // Otherwise the connection stays open and the pool dries up.
-        Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
-          Right(new ContainerResponse(response.status.intValue(), o.toString(), None))
-        }
+    request(req)
+      .flatMap({ response =>
+        if (response.status.isSuccess()) {
+          Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
+            Right(ContainerResponse(true, o.toString))
+          }
+        } else {
+          println("retry here...")
+          // This is important, as it drains the entity stream.
+          // Otherwise the connection stays open and the pool dries up.
+          Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
+            Right(new ContainerResponse(response.status.intValue(), o.toString(), None))
+          }
 
-      }
-    })
+        }
+      })
   }
 }
+// Used internally to wrap all exceptions for which the request can be retried
+private case class RetryableConnectionError(t: Throwable) extends Exception(t) with NoStackTrace
+
 object HttpUtils3 {
 
   /** A helper method to post one single request to a connection. Used for container tests. */
@@ -106,7 +110,7 @@ object HttpUtils3 {
     ec: ExecutionContext,
     tid: TransactionId): (Int, Option[JsObject]) = {
     val connection = new HttpUtils3(host, port, 90.seconds, 1.MB)
-    val response = executeRequest(connection, endPoint, content, Some(HttpClientContext.create()))
+    val response = executeRequest(connection, endPoint, content)
     connection.close()
     Await.result(response, timeout)
   }
@@ -119,31 +123,37 @@ object HttpUtils3 {
     ec: ExecutionContext): Seq[(Int, Option[JsObject])] = {
     val connection = new HttpUtils3(host, port, 90.seconds, 1.MB, 20)
     val futureResults = contents.map(content => {
-      connection
-        .post(endPoint, content)
-        .map({
-          case Left(e)  => (500, None)
-          case Right(r) => (r.statusCode, Try(r.entity.parseJson.asJsObject).toOption)
-        })
+      val res = executeRequest(connection, endPoint, content)
+      res.recoverWith({
+        case e: RetryableConnectionError =>
+          println(s"retrying after ${e}")
+          executeRequest(connection, endPoint, content)
+      })
+      res
     })
     val results = Await.result(Future.sequence(futureResults), timeout)
     connection.close()
     results
   }
 
-  private def executeRequest(connection: HttpUtils3, endpoint: String, content: JsValue, context: Option[HttpContext])(
+  private def executeRequest(connection: HttpUtils3, endpoint: String, content: JsValue)(
     implicit logging: Logging,
     as: ActorSystem,
     ec: ExecutionContext,
     tid: TransactionId): Future[(Int, Option[JsObject])] = {
 
-    connection.post(endpoint, content) map {
-      case Right(r)                   => (r.statusCode, Try(r.entity.parseJson.asJsObject).toOption)
-      case Left(NoResponseReceived()) => throw new IllegalStateException("no response from container")
-      case Left(Timeout(_))           => throw new java.util.concurrent.TimeoutException()
-      case Left(ConnectionError(t: java.net.SocketTimeoutException)) =>
-        throw new java.util.concurrent.TimeoutException()
-      case Left(ConnectionError(t)) => throw new IllegalStateException(t.getMessage)
-    }
+    val res = connection
+      .post(endpoint, content)
+      .map({
+        case Right(r)                   => (r.statusCode, Try(r.entity.parseJson.asJsObject).toOption)
+        case Left(NoResponseReceived()) => throw new IllegalStateException("no response from container")
+        case Left(Timeout(_))           => throw new java.util.concurrent.TimeoutException()
+        case Left(ConnectionError(t: java.net.SocketTimeoutException)) =>
+          throw new java.util.concurrent.TimeoutException()
+//        case Left(ConnectionError(t)) =>  throw new IllegalStateException(t.getMessage)
+        case Left(ConnectionError(t)) => throw new RetryableConnectionError(t)
+      })
+
+    res
   }
 }
