@@ -29,6 +29,7 @@ import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
+import scala.concurrent.TimeoutException
 import scala.concurrent.duration._
 import scala.util.Try
 import scala.util.control.NoStackTrace
@@ -57,6 +58,7 @@ protected class HttpUtils3(hostname: String,
                            port: Int,
                            timeout: FiniteDuration,
                            maxResponse: ByteSize,
+                           retryInterval: FiniteDuration = 100.milliseconds,
                            maxConcurrent: Int = 1)(implicit logging: Logging, as: ActorSystem)
     extends PoolingRestClient3("http", hostname, port, 16 * 1024) {
 
@@ -74,18 +76,19 @@ protected class HttpUtils3(hostname: String,
    * @param retry whether or not to retry on connection failure
    * @return Left(Error Message) or Right(Status Code, Response as UTF-8 String)
    */
-  def post(endpoint: String, body: JsValue)(
+  def post(endpoint: String, body: JsValue, retry: Boolean)(
     implicit tid: TransactionId): Future[Either[ContainerHttpError, ContainerResponse]] = {
 
-    val b = Marshal(body).to[MessageEntity]
-    val req = b.map { b =>
+    val req = Marshal(body).to[MessageEntity].map { b =>
       HttpRequest(HttpMethods.POST, endpoint, entity = b)
     }
-    val retryOnTCPErrors = true
-    val retryInterval = 1.seconds
 
     val promise = Promise[HttpResponse]
 
+    // Timeout includes all retries.
+    as.scheduler.scheduleOnce(timeout) {
+      promise.tryFailure(new TimeoutException(s"Request to ${endpoint} could not be completed in time."))
+    }
     def tryOnce(): Unit =
       if (!promise.isCompleted) {
         val res = request(req)
@@ -96,11 +99,10 @@ protected class HttpUtils3(hostname: String,
         }
 
         res.onFailure {
-          case e: akka.stream.StreamTcpException
-              if retryOnTCPErrors => // TCP error (e.g. connection couldn't be opened)
-            println(s"retrying on error ${e}")
+          case _: akka.stream.StreamTcpException if retry =>
+            // TCP error (e.g. connection couldn't be opened)
+            // Note: this is REQUIRED since the container may start, but ports are not listening before requests are made.
             as.scheduler.scheduleOnce(retryInterval) { tryOnce() }
-
           case t: Throwable =>
             // Other error. We fail the promise.
             promise.tryFailure(t)
@@ -116,7 +118,6 @@ protected class HttpUtils3(hostname: String,
             Right(ContainerResponse(true, o.toString))
           }
         } else {
-          println("retry here...")
           // This is important, as it drains the entity stream.
           // Otherwise the connection stays open and the pool dries up.
           Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
@@ -150,16 +151,8 @@ object HttpUtils3 {
     tid: TransactionId,
     as: ActorSystem,
     ec: ExecutionContext): Seq[(Int, Option[JsObject])] = {
-    val connection = new HttpUtils3(host, port, 90.seconds, 1.MB, 20)
-    val futureResults = contents.map(content => {
-      val res = executeRequest(connection, endPoint, content)
-      res.recoverWith({
-        case e: RetryableConnectionError =>
-          println(s"retrying after ${e}")
-          executeRequest(connection, endPoint, content)
-      })
-      res
-    })
+    val connection = new HttpUtils3(host, port, 90.seconds, 1.MB, maxConcurrent = contents.size)
+    val futureResults = contents.map { executeRequest(connection, endPoint, _) }
     val results = Await.result(Future.sequence(futureResults), timeout)
     connection.close()
     results
@@ -172,15 +165,14 @@ object HttpUtils3 {
     tid: TransactionId): Future[(Int, Option[JsObject])] = {
 
     val res = connection
-      .post(endpoint, content)
+      .post(endpoint, content, true)
       .map({
         case Right(r)                   => (r.statusCode, Try(r.entity.parseJson.asJsObject).toOption)
         case Left(NoResponseReceived()) => throw new IllegalStateException("no response from container")
         case Left(Timeout(_))           => throw new java.util.concurrent.TimeoutException()
         case Left(ConnectionError(t: java.net.SocketTimeoutException)) =>
           throw new java.util.concurrent.TimeoutException()
-//        case Left(ConnectionError(t)) =>  throw new IllegalStateException(t.getMessage)
-        case Left(ConnectionError(t)) => throw new RetryableConnectionError(t)
+        case Left(ConnectionError(t)) => throw new IllegalStateException(t.getMessage)
       })
 
     res
