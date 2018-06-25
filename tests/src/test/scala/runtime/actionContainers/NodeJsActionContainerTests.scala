@@ -552,7 +552,8 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
     val concurrentCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
     require(concurrentCount > 100, "test requires that max-connections be set > 100")
-    println(s"running $concurrentCount requests")
+    val requestCount = concurrentCount * 2
+    println(s"running $requestCount requests")
 
     val (out, err) = withNodeJsContainer { c =>
       //this action will create a log entry, and only complete once all activations have arrived and emitted logs
@@ -565,10 +566,10 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
            |     console.log("interleave me");
            |     return new Promise(function(resolve, reject) {
            |         setTimeout(function() {
-           |             if (global.count == $concurrentCount) {
+           |             if (global.count == $requestCount) {
            |                 resolve({ args: args});
            |             } else {
-           |                 reject("did not receive $concurrentCount activations within 20s");
+           |                 reject("did not receive $requestCount activations within 20s");
            |             }
            |         }, 20000);
            |    });
@@ -577,7 +578,7 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
       c.init(initPayload(code))._1 should be(200)
 
-      val payloads = (1 to concurrentCount).map({ i =>
+      val payloads = (1 to requestCount).map({ i =>
         JsObject(s"arg$i" -> JsString(s"value$i"))
       })
 
@@ -591,12 +592,12 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
     checkStreams(out, err, {
       case (o, e) =>
-        o.replaceAll("\n", "") shouldBe "interleave me" * concurrentCount
+        o.replaceAll("\n", "") shouldBe "interleave me" * requestCount
         e shouldBe empty
-    }, concurrentCount)
+    }, requestCount)
 
     withClue("expected grouping of stdout sentinels") {
-      out should include((ActionContainer.sentinel + "\n") * concurrentCount)
+      out should include((ActionContainer.sentinel + "\n") * requestCount)
     }
   }
 }
