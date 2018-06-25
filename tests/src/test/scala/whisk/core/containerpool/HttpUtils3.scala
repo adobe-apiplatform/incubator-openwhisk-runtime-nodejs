@@ -22,11 +22,13 @@ import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.model.HttpMethods
 import akka.http.scaladsl.model.HttpRequest
+import akka.http.scaladsl.model.HttpResponse
 import akka.http.scaladsl.model.MessageEntity
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
+import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.util.Try
 import scala.util.control.NoStackTrace
@@ -37,7 +39,6 @@ import whisk.core.entity.ActivationResponse.ContainerHttpError
 import whisk.core.entity.ActivationResponse._
 import whisk.core.entity.ByteSize
 import whisk.core.entity.size.SizeLong
-import whisk.http.PoolingRestClient
 
 /**
  * This HTTP client is used only in the invoker to communicate with the action container.
@@ -57,7 +58,7 @@ protected class HttpUtils3(hostname: String,
                            timeout: FiniteDuration,
                            maxResponse: ByteSize,
                            maxConcurrent: Int = 1)(implicit logging: Logging, as: ActorSystem)
-    extends PoolingRestClient("http", hostname, port, 16 * 1024) {
+    extends PoolingRestClient3("http", hostname, port, 16 * 1024) {
 
   def close() = Unit //Try(connection.close())
 
@@ -80,7 +81,35 @@ protected class HttpUtils3(hostname: String,
     val req = b.map { b =>
       HttpRequest(HttpMethods.POST, endpoint, entity = b)
     }
-    request(req)
+    val retryOnTCPErrors = true
+    val retryInterval = 1.seconds
+
+    val promise = Promise[HttpResponse]
+
+    def tryOnce(): Unit =
+      if (!promise.isCompleted) {
+        val res = request(req)
+        res.onSuccess {
+          //todo: handle retries for non-200 status codes
+          case r =>
+            promise.trySuccess(r)
+        }
+
+        res.onFailure {
+          case e: akka.stream.StreamTcpException
+              if retryOnTCPErrors => // TCP error (e.g. connection couldn't be opened)
+            println(s"retrying on error ${e}")
+            as.scheduler.scheduleOnce(retryInterval) { tryOnce() }
+
+          case t: Throwable =>
+            // Other error. We fail the promise.
+            promise.tryFailure(t)
+        }
+      }
+
+    tryOnce()
+
+    promise.future
       .flatMap({ response =>
         if (response.status.isSuccess()) {
           Unmarshal(response.entity.withoutSizeLimit()).to[JsObject].map { o =>
