@@ -552,7 +552,7 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
     val concurrentCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
     require(concurrentCount > 100, "test requires that max-connections be set > 100")
-    val requestCount = concurrentCount * 2
+    val requestCount = math.max(concurrentCount, 200)
     println(s"running $requestCount requests")
 
     val (out, err) = withNodeJsContainer { c =>
