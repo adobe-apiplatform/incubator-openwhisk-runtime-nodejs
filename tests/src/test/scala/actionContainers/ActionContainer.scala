@@ -231,7 +231,7 @@ object ActionContainer {
 
     implicit val transid = TransactionId.testing
 
-    whisk.core.containerpool.HttpUtils2.post(host, port, endPoint, content)
+    whisk.core.containerpool.HttpUtils3.post(host, port, endPoint, content)
   }
   private def concurrentSyncPost(host: String, port: Int, endPoint: String, contents: Seq[JsValue])(
     implicit logging: Logging,
@@ -240,6 +240,6 @@ object ActionContainer {
 
     implicit val transid = TransactionId.testing
 
-    whisk.core.containerpool.HttpUtils2.concurrentPost(host, port, endPoint, contents, 120.seconds)
+    whisk.core.containerpool.HttpUtils3.concurrentPost(host, port, endPoint, contents, 120.seconds)
   }
 }
