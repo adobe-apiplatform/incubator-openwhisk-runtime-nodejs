@@ -19,33 +19,29 @@ package whisk.core.containerpool
 
 import java.net.NoRouteToHostException
 import java.nio.charset.StandardCharsets
+
 import org.apache.commons.io.IOUtils
 import org.apache.http.HttpHeaders
 import org.apache.http.client.config.RequestConfig
-import org.apache.http.client.methods.HttpPost
-import org.apache.http.client.methods.HttpRequestBase
-import org.apache.http.client.protocol.HttpClientContext
-import org.apache.http.client.utils.URIBuilder
+import org.apache.http.client.methods.{HttpPost, HttpRequestBase}
+import org.apache.http.client.utils.{HttpClientUtils, URIBuilder}
 import org.apache.http.conn.HttpHostConnectException
 import org.apache.http.entity.StringEntity
+import org.apache.http.impl.NoConnectionReuseStrategy
 import org.apache.http.impl.client.HttpClientBuilder
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager
-import org.apache.http.protocol.HttpContext
-import scala.annotation.tailrec
-import scala.concurrent.Await
-import scala.concurrent.ExecutionContext
-import scala.concurrent.Future
-import scala.concurrent.duration._
-import scala.util.Failure
-import scala.util.Success
-import scala.util.Try
-import scala.util.control.NoStackTrace
+import org.apache.http.util.EntityUtils
 import spray.json._
-import whisk.common.Logging
-import whisk.common.TransactionId
+import whisk.common.{Logging, TransactionId}
 import whisk.core.entity.ActivationResponse._
 import whisk.core.entity.ByteSize
 import whisk.core.entity.size.SizeLong
+
+import scala.annotation.tailrec
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration._
+import scala.util.{Failure, Success, Try}
+import scala.util.control.NoStackTrace
 
 /**
  * This HTTP client is used only in the invoker to communicate with the action container.
@@ -62,9 +58,17 @@ import whisk.core.entity.size.SizeLong
  */
 protected class HttpUtils2(hostname: String, timeout: FiniteDuration, maxResponse: ByteSize, maxConcurrent: Int = 1)(
   implicit logging: Logging) {
-  println("using HttpUtils2")
+  if (maxConcurrent > 1) {
+    println("using HttpUtils2-new:" + maxConcurrent)
+  }
 
-  def close() = Try(connection.close())
+  /**
+   * Closes the HttpClient and all resources allocated by it.
+   *
+   * This will close the HttpClient that is generated for this instance of HttpUtils. That will also cause the
+   * ConnectionManager to be closed alongside.
+   */
+  def close(): Unit = HttpClientUtils.closeQuietly(connection)
 
   /**
    * Posts to hostname/endpoint the given JSON object.
@@ -78,7 +82,7 @@ protected class HttpUtils2(hostname: String, timeout: FiniteDuration, maxRespons
    * @param retry whether or not to retry on connection failure
    * @return Left(Error Message) or Right(Status Code, Response as UTF-8 String)
    */
-  def post(endpoint: String, body: JsValue, retry: Boolean, context: Option[HttpContext])(
+  def post(endpoint: String, body: JsValue, retry: Boolean)(
     implicit tid: TransactionId): Either[ContainerHttpError, ContainerResponse] = {
     val entity = new StringEntity(body.compactPrint, StandardCharsets.UTF_8)
     entity.setContentType("application/json")
@@ -87,36 +91,35 @@ protected class HttpUtils2(hostname: String, timeout: FiniteDuration, maxRespons
     request.addHeader(HttpHeaders.ACCEPT, "application/json")
     request.setEntity(entity)
 
-    execute(request, timeout, maxConcurrent, retry, context)
+    execute(request, timeout, maxConcurrent, retry)
   }
 
   // Used internally to wrap all exceptions for which the request can be retried
   private case class RetryableConnectionError(t: Throwable) extends Exception(t) with NoStackTrace
 
   // Annotation will make the compiler complain if no tail recursion is possible
-  @tailrec private def execute(
-    request: HttpRequestBase,
-    timeout: FiniteDuration,
-    maxConcurrent: Int,
-    retry: Boolean,
-    context: Option[HttpContext])(implicit tid: TransactionId): Either[ContainerHttpError, ContainerResponse] = {
-    pool.foreach(cm => {
-      println(cm.getTotalStats)
-    })
-
-    Try(connection.execute(request, context.getOrElse(HttpClientContext.create()))).map { response =>
+  @tailrec private def execute(request: HttpRequestBase, timeout: FiniteDuration, maxConcurrent: Int, retry: Boolean)(
+    implicit tid: TransactionId): Either[ContainerHttpError, ContainerResponse] = {
+    Try(connection.execute(request)).map { response =>
       val containerResponse = Option(response.getEntity)
         .map { entity =>
           val statusCode = response.getStatusLine.getStatusCode
           val contentLength = entity.getContentLength
 
+          // Negative contentLength means unknown or overflow. We don't want to consume in either case.
           if (contentLength >= 0) {
-            val bytesToRead = Math.min(contentLength, maxResponseBytes)
-            val bytes = IOUtils.toByteArray(entity.getContent, bytesToRead)
-            val str = new String(bytes, StandardCharsets.UTF_8)
-            val truncated = if (contentLength <= maxResponseBytes) None else Some(contentLength.B, maxResponse)
-            Right(ContainerResponse(statusCode, str, truncated))
+            if (contentLength <= maxResponseBytes) {
+              // optimized route to consume the entire stream into a string
+              val str = EntityUtils.toString(entity, StandardCharsets.UTF_8) // consumes and closes the whole stream
+              Right(ContainerResponse(statusCode, str, None))
+            } else {
+              // only consume a bounded number of bytes according to the system limits
+              val str = new String(IOUtils.toByteArray(entity.getContent, maxResponseBytes), StandardCharsets.UTF_8)
+              EntityUtils.consumeQuietly(entity) // consume the rest of the stream to free the connection
+              Right(ContainerResponse(statusCode, str, Some(contentLength.B, maxResponse)))
+            }
           } else {
+            EntityUtils.consumeQuietly(entity) // silently consume the whole stream to free the connection
             Left(NoResponseReceived())
           }
         }
@@ -145,7 +148,7 @@ protected class HttpUtils2(hostname: String, timeout: FiniteDuration, maxRespons
         if (timeout > Duration.Zero) {
           Thread.sleep(sleepTime.toMillis)
           val newTimeout = timeout - sleepTime
-          execute(request, newTimeout, maxConcurrent, retry = true, context)
+          execute(request, newTimeout, maxConcurrent, retry = true)
         } else {
           logging.warn(this, s"POST failed with $t - no retry because timeout exceeded.")
           Left(Timeout(t))
@@ -166,25 +169,29 @@ protected class HttpUtils2(hostname: String, timeout: FiniteDuration, maxRespons
     .setSocketTimeout(timeout.toMillis.toInt)
     .build
 
-  private var pool: Option[PoolingHttpClientConnectionManager] = None
   private val connection = HttpClientBuilder.create
     .setDefaultRequestConfig(httpconfig)
-    .setConnectionManager(if (maxConcurrent > 1) {
-      // Use PoolingHttpClientConnectionManager so that concurrent activation processing (if enabled) will reuse connections
-      val cm = new PoolingHttpClientConnectionManager
-      // Increase default max connections per route (default is 2)
+    // Connections are not reused by most of the available runtimes. To circumvent any issues we might have regarding
+    // connections randomly breaking due to our pause/resume cycle, we don't reuse connections at all.
+    .setConnectionReuseStrategy(new NoConnectionReuseStrategy)
+    .setConnectionManager {
+      // A PoolingHttpClientConnectionManager is the default when not specifying any ConnectionManager.
+      // The PoolingHttpClientConnectionManager has the benefit of actively checking if a connection has become stale,
+      // which is very important because pausing/resuming containers can cause a connection to become silently broken.
+      // This causes very subtle bugs, especially when containers are reused after a pretty long time (like > 5 minutes).
+      //
+      // The BasicHttpClientConnectionManager (which would be alternative here) doesn't have such a mechanism and thus
+      // isn't suitable for our usage.
+      val cm = new PoolingHttpClientConnectionManager()
+      // perRoute effectively means per host in our use-case, which means setting it to the same value as the maximum
+      // total of all connections in the pool is appropriate here.
       cm.setDefaultMaxPerRoute(maxConcurrent)
-      // Increase max total connections (default is 20)
       cm.setMaxTotal(maxConcurrent)
-//      cm.setDefaultConnectionConfig()
-      pool = Some(cm)
       cm
-    } else null) //set the Pooling connection manager IFF maxConcurrent > 1
+    }
     .useSystemProperties()
     .disableAutomaticRetries()
     .build
-
-  val context = HttpClientContext.create
 }
 
 object HttpUtils2 {
@@ -193,7 +200,7 @@ object HttpUtils2 {
   def post(host: String, port: Int, endPoint: String, content: JsValue)(implicit logging: Logging,
                                                                         tid: TransactionId): (Int, Option[JsObject]) = {
     val connection = new HttpUtils2(s"$host:$port", 90.seconds, 1.MB)
-    val response = executeRequest(connection, endPoint, content, Some(HttpClientContext.create()))
+    val response = executeRequest(connection, endPoint, content)
     connection.close()
     response
   }
@@ -203,28 +210,21 @@ object HttpUtils2 {
     implicit logging: Logging,
     tid: TransactionId,
     ec: ExecutionContext): Seq[(Int, Option[JsObject])] = {
-    val connection = new HttpUtils2(s"$host:$port", 90.seconds, 1.MB, 20)
-    val futureResults = contents.map(content => {
-
-      Future {
-        val context = HttpClientContext.create();
-        executeRequest(connection, endPoint, content, Some(context))
-      }
-    })
+    val connection = new HttpUtils2(s"$host:$port", 90.seconds, 1.MB, contents.size)
+    val futureResults = contents.map(content => Future { executeRequest(connection, endPoint, content) })
     val results = Await.result(Future.sequence(futureResults), timeout)
     connection.close()
     results
   }
 
-  private def executeRequest(connection: HttpUtils2, endpoint: String, content: JsValue, context: Option[HttpContext])(
+  private def executeRequest(connection: HttpUtils2, endpoint: String, content: JsValue)(
     implicit logging: Logging,
     tid: TransactionId): (Int, Option[JsObject]) = {
-
-    connection.post(endpoint, content, retry = true, context) match {
+    connection.post(endpoint, content, retry = true) match {
       case Right(r)                   => (r.statusCode, Try(r.entity.parseJson.asJsObject).toOption)
       case Left(NoResponseReceived()) => throw new IllegalStateException("no response from container")
       case Left(Timeout(_))           => throw new java.util.concurrent.TimeoutException()
-      case Left(ConnectionError(t: java.net.SocketTimeoutException)) =>
+      case Left(ConnectionError(_: java.net.SocketTimeoutException)) =>
         throw new java.util.concurrent.TimeoutException()
       case Left(ConnectionError(t)) => throw new IllegalStateException(t.getMessage)
     }

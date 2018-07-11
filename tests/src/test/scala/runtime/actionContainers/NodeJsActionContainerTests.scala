@@ -550,9 +550,9 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
 
   it should "allow running activations concurrently" in {
 
-    val requestCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
-    require(requestCount > 100, "test requires that max-connections be set > 100")
-
+//    val requestCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
+//    require(requestCount > 100, "test requires that max-connections be set > 100")
+    val requestCount = 8
     println(s"running $requestCount requests")
 
     val (out, err) = withNodeJsContainer { c =>
