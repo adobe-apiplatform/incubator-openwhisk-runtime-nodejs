@@ -100,7 +100,6 @@ protected class HttpUtils3(hostname: String,
         res.onSuccess {
           //todo: handle retries for non-200 status codes
           case r =>
-            r.headers.foreach(println(_))
             promise.trySuccess(r)
         }
 
