@@ -547,4 +547,56 @@ abstract class NodeJsActionContainerTests extends BasicActionRunnerTests with Ws
         e shouldBe empty
     })
   }
+
+  it should "allow running activations concurrently" in {
+
+    val requestCount = actorSystem.settings.config.getInt("akka.http.host-connection-pool.max-connections")
+    require(requestCount > 100, "test requires that max-connections be set > 100")
+    println(s"running $requestCount requests")
+
+    val (out, err) = withNodeJsContainer { c =>
+      //this action will create a log entry, and only complete once all activations have arrived and emitted logs
+
+      val code =
+        s"""
+           | global.count = 0;
+           | function main(args) {
+           |     global.count++;
+           |     console.log("interleave me");
+           |     return new Promise(function(resolve, reject) {
+           |         setTimeout(function() {
+           |             if (global.count == $requestCount) {
+           |                 resolve({ args: args});
+           |             } else {
+           |                 reject("did not receive $requestCount activations within 30s");
+           |             }
+           |         }, 30000);
+           |    });
+           | }
+        """.stripMargin
+
+      c.init(initPayload(code))._1 should be(200)
+
+      val payloads = (1 to requestCount).map({ i =>
+        JsObject(s"arg$i" -> JsString(s"value$i"))
+      })
+
+      val responses = c.runMultiple(payloads.map {
+        runPayload(_)
+      })
+      payloads.foreach { a =>
+        responses should contain(200, Some(JsObject("args" -> a)))
+      }
+    }
+
+    checkStreams(out, err, {
+      case (o, e) =>
+        o.replaceAll("\n", "") shouldBe "interleave me" * requestCount
+        e shouldBe empty
+    }, requestCount)
+
+    withClue("expected grouping of stdout sentinels") {
+      out should include((ActionContainer.sentinel + "\n") * requestCount)
+    }
+  }
 }
